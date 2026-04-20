@@ -1,15 +1,16 @@
 package pubsub
 
 import (
-    "errors"
-    "io"
-    "runtime"
+	"errors"
+	"io"
+	"sync/atomic"
+
+	pool "github.com/TikaFlow/worker-pool"
 )
 
 var (
-    ErrBusClosed     = errors.New("pubsub: bus is closed")
-    ErrNotConcrete   = errors.New("pubsub: publish topic must be concrete (no wildcards)")
-    ErrNotFound      = errors.New("pubsub: subscription not found")
+	ErrBusClosed    = errors.New("pubsub: bus is closed")
+	ErrInvalidTopic = errors.New("pubsub: invalid topic")
 )
 
 // SubscriptionID 订阅唯一标识
@@ -20,319 +21,194 @@ type Handler func(topic string, message any)
 
 // subscription 内部订阅结构
 type subscription struct {
-    id      SubscriptionID
-    topic   string
-    handler Handler
-    once    bool
+	id      SubscriptionID
+	topic   string
+	handler Handler
+	once    bool
 }
 
-// 内部请求类型
-type subRequest struct {
-    topic   string
-    handler Handler
-    once    bool
-    resp    chan subResponse
+// Bus 数据总线接口
+type Bus interface {
+	io.Closer
+	Subscribe(topic string, handler Handler) (SubscriptionID, error)
+	SubscribeOnce(topic string, handler Handler) (SubscriptionID, error)
+	Publish(topic string, message any) error
+	UnSubscribe(id SubscriptionID)
+	UnSubscribeAll()
 }
 
-type subResponse struct {
-    id  SubscriptionID
-    err error
-}
+type subscriptionMap map[SubscriptionID]*subscription
 
-type unsubRequest struct {
-    id   SubscriptionID
-    resp chan error
-}
-
-type unsubAllRequest struct {
-    resp chan struct{}
-}
-
-type pubRequest struct {
-    topic   string
-    message any
-}
-
-// Bus 数据总线实例
-type Bus struct {
-    subCh      chan *subRequest
-    unsubCh    chan *unsubRequest
-    unsubAllCh chan *unsubAllRequest
-    pubCh      chan *pubRequest
-    closeCh    chan struct{}
-    doneCh     chan struct{}
-    sem        chan struct{}
+// dataBus 数据总线实例
+type dataBus struct {
+	subs     map[string]subscriptionMap
+	idMap    map[SubscriptionID]string
+	nextID   atomic.Uint64
+	closed   atomic.Bool
+	mgr      pool.Pool
+	taskPool pool.Pool
 }
 
 // New 创建一个新的数据总线实例
-func New() *Bus {
-    maxConc := runtime.NumCPU() * 2
-    if maxConc < 8 {
-        maxConc = 8
-    }
+func New() *dataBus {
+	bus := &dataBus{
+		idMap:    make(map[SubscriptionID]string),
+		subs:     make(map[string]subscriptionMap),
+		mgr:      pool.New(1, nil),
+		taskPool: pool.New(8, nil),
+	}
 
-    b := &Bus{
-        subCh:      make(chan *subRequest, 64),
-        unsubCh:    make(chan *unsubRequest, 64),
-        unsubAllCh: make(chan *unsubAllRequest, 16),
-        pubCh:      make(chan *pubRequest, 128),
-        closeCh:    make(chan struct{}),
-        doneCh:     make(chan struct{}),
-        sem:        make(chan struct{}, maxConc),
-    }
-
-    go b.run()
-
-    return b
+	return bus
 }
 
-// run 事件循环，在独立 goroutine 中运行
-func (b *Bus) run() {
-    exactSubs := make(map[string][]*subscription)
-    wildSubs := make([]*subscription, 0)
-    nextID := SubscriptionID(0)
+// sub 内部订阅函数
+func (bus *dataBus) sub(topic string, handler Handler, once bool) (SubscriptionID, error) {
+	if bus.closed.Load() {
+		return 0, ErrBusClosed
+	}
 
-    for {
-        select {
-        case req := <-b.subCh:
-            if err := validateTopic(req.topic); err != nil {
-                req.resp <- subResponse{err: err}
-                continue
-            }
-            nextID++
-            sub := &subscription{
-                id:      nextID,
-                topic:   req.topic,
-                handler: req.handler,
-                once:    req.once,
-            }
-            if hasWildcard(req.topic) {
-                wildSubs = append(wildSubs, sub)
-            } else {
-                exactSubs[req.topic] = append(exactSubs[req.topic], sub)
-            }
-            req.resp <- subResponse{id: nextID}
+	if !isValidTopic(topic) {
+		return 0, ErrInvalidTopic
+	}
 
-        case req := <-b.unsubCh:
-            found := false
-            for topic, subs := range exactSubs {
-                for i, sub := range subs {
-                    if sub.id == req.id {
-                        exactSubs[topic] = append(subs[:i], subs[i+1:]...)
-                        if len(exactSubs[topic]) == 0 {
-                            delete(exactSubs, topic)
-                        }
-                        found = true
-                        break
-                    }
-                }
-                if found {
-                    break
-                }
-            }
-            if !found {
-                for i, sub := range wildSubs {
-                    if sub.id == req.id {
-                        wildSubs = append(wildSubs[:i], wildSubs[i+1:]...)
-                        found = true
-                        break
-                    }
-                }
-            }
-            if found {
-                req.resp <- nil
-            } else {
-                req.resp <- ErrNotFound
-            }
+	id := SubscriptionID(bus.nextID.Add(1))
+	subTask := func() {
+		sub := &subscription{
+			id:      id,
+			topic:   topic,
+			handler: handler,
+			once:    once,
+		}
+		bus.idMap[id] = topic
+		if _, ok := bus.subs[topic]; !ok {
+			bus.subs[topic] = make(subscriptionMap)
+		}
+		bus.subs[topic][id] = sub
+	}
+	bus.mgr.Add(subTask)
 
-        case req := <-b.unsubAllCh:
-            for topic := range exactSubs {
-                delete(exactSubs, topic)
-            }
-            wildSubs = wildSubs[:0]
-            req.resp <- struct{}{}
-
-        case req := <-b.pubCh:
-            matched := make([]*subscription, 0)
-
-            if subs, ok := exactSubs[req.topic]; ok {
-                for _, sub := range subs {
-                    matched = append(matched, sub)
-                }
-            }
-
-            for _, sub := range wildSubs {
-                if topicMatch(sub.topic, req.topic) {
-                    matched = append(matched, sub)
-                }
-            }
-
-            var onceIDs []SubscriptionID
-            for _, sub := range matched {
-                if sub.once {
-                    onceIDs = append(onceIDs, sub.id)
-                }
-            }
-
-            for _, id := range onceIDs {
-                for topic, subs := range exactSubs {
-                    for i, sub := range subs {
-                        if sub.id == id {
-                            exactSubs[topic] = append(subs[:i], subs[i+1:]...)
-                            if len(exactSubs[topic]) == 0 {
-                                delete(exactSubs, topic)
-                            }
-                            break
-                        }
-                    }
-                }
-                for i, sub := range wildSubs {
-                    if sub.id == id {
-                        wildSubs = append(wildSubs[:i], wildSubs[i+1:]...)
-                        break
-                    }
-                }
-            }
-
-            for _, sub := range matched {
-                b.sem <- struct{}{}
-                go func(h Handler, t string, m any) {
-                    defer func() {
-                        recover()
-                        <-b.sem
-                    }()
-                    h(t, m)
-                }(sub.handler, req.topic, req.message)
-            }
-
-        case <-b.closeCh:
-            close(b.doneCh)
-            return
-        }
-    }
+	return id, nil
 }
 
-// isClosed 检查总线是否已关闭
-func (b *Bus) isClosed() bool {
-    select {
-    case <-b.doneCh:
-        return true
-    default:
-        return false
-    }
-}
-
-// Subscribe 订阅主题，handler 将在独立 goroutine 中异步调用
-func (b *Bus) Subscribe(topic string, handler Handler) (SubscriptionID, error) {
-    if b.isClosed() {
-        return 0, ErrBusClosed
-    }
-    req := &subRequest{
-        topic:   topic,
-        handler: handler,
-        once:    false,
-        resp:    make(chan subResponse, 1),
-    }
-    b.subCh <- req
-    resp := <-req.resp
-    return resp.id, resp.err
+// Subscribe 订阅主题，handler 将在 taskPool 中异步调用
+func (bus *dataBus) Subscribe(topic string, handler Handler) (SubscriptionID, error) {
+	return bus.sub(topic, handler, false)
 }
 
 // SubscribeOnce 单次订阅，收到一次消息后自动取消订阅
-func (b *Bus) SubscribeOnce(topic string, handler Handler) (SubscriptionID, error) {
-    if b.isClosed() {
-        return 0, ErrBusClosed
-    }
-    req := &subRequest{
-        topic:   topic,
-        handler: handler,
-        once:    true,
-        resp:    make(chan subResponse, 1),
-    }
-    b.subCh <- req
-    resp := <-req.resp
-    return resp.id, resp.err
+func (bus *dataBus) SubscribeOnce(topic string, handler Handler) (SubscriptionID, error) {
+	return bus.sub(topic, handler, true)
 }
 
 // Publish 发布消息，topic 必须是具体的（不含通配符）
-func (b *Bus) Publish(topic string, message any) error {
-    if b.isClosed() {
-        return ErrBusClosed
-    }
-    if !isConcreteTopic(topic) {
-        return ErrNotConcrete
-    }
-    b.pubCh <- &pubRequest{topic: topic, message: message}
-    return nil
+func (bus *dataBus) Publish(topic string, message any) error {
+	if bus.closed.Load() {
+		return ErrBusClosed
+	}
+
+	if hasWildcard(topic) {
+		return ErrInvalidTopic
+	}
+
+	pubTask := func() {
+		for pattern, idSub := range bus.subs {
+			matched := false
+			if !hasWildcard(pattern) {
+				matched = pattern == topic
+			} else {
+				matched = topicMatch(pattern, topic)
+			}
+
+			if matched {
+				for _, sub := range idSub {
+					if sub.once {
+						bus.unsubTask(sub.id)
+					}
+					bus.taskPool.Add(func() {
+						sub.handler(topic, message)
+					})
+				}
+			}
+
+		}
+	}
+	bus.mgr.Add(pubTask)
+
+	return nil
+}
+
+func (bus *dataBus) unsubTask(id SubscriptionID) {
+	if topic, exists := bus.idMap[id]; exists {
+		delete(bus.subs[topic], id)
+        if len(bus.subs[topic]) == 0 {
+            delete(bus.subs, topic)
+        }
+		delete(bus.idMap, id)
+	}
 }
 
 // UnSubscribe 取消订阅
-func (b *Bus) UnSubscribe(id SubscriptionID) error {
-    if b.isClosed() {
-        return ErrBusClosed
-    }
-    req := &unsubRequest{
-        id:   id,
-        resp: make(chan error, 1),
-    }
-    b.unsubCh <- req
-    return <-req.resp
+func (bus *dataBus) UnSubscribe(id SubscriptionID) {
+	if bus.closed.Load() {
+		return
+	}
+
+	bus.mgr.Add(func() {
+		bus.unsubTask(id)
+	})
 }
 
 // UnSubscribeAll 取消所有订阅
-func (b *Bus) UnSubscribeAll() {
-    if b.isClosed() {
-        return
-    }
-    req := &unsubAllRequest{
-        resp: make(chan struct{}, 1),
-    }
-    b.unsubAllCh <- req
-    <-req.resp
+func (bus *dataBus) UnSubscribeAll() {
+	unsubTask := func() {
+		clear(bus.subs)
+		clear(bus.idMap)
+	}
+	bus.mgr.Add(unsubTask)
 }
 
 // Close 关闭数据总线，实现 io.Closer 接口
-func (b *Bus) Close() error {
-    if b.isClosed() {
-        return ErrBusClosed
-    }
-    close(b.closeCh)
-    <-b.doneCh
-    return nil
-}
+func (bus *dataBus) Close() error {
+	if bus.closed.Load() {
+		return ErrBusClosed
+	}
 
-// 确认 Bus 实现了 io.Closer 接口
-var _ io.Closer = (*Bus)(nil)
+	bus.closed.Store(true)
+	bus.mgr.Close()
+	bus.taskPool.Close()
+
+	return nil
+}
 
 // 全局默认实例
 var defaultBus = New()
 
 // Subscribe 使用默认总线订阅主题
 func Subscribe(topic string, handler Handler) (SubscriptionID, error) {
-    return defaultBus.Subscribe(topic, handler)
+	return defaultBus.Subscribe(topic, handler)
 }
 
 // SubscribeOnce 使用默认总线单次订阅
 func SubscribeOnce(topic string, handler Handler) (SubscriptionID, error) {
-    return defaultBus.SubscribeOnce(topic, handler)
+	return defaultBus.SubscribeOnce(topic, handler)
 }
 
 // Publish 使用默认总线发布消息
 func Publish(topic string, message any) error {
-    return defaultBus.Publish(topic, message)
+	return defaultBus.Publish(topic, message)
 }
 
 // UnSubscribe 使用默认总线取消订阅
-func UnSubscribe(id SubscriptionID) error {
-    return defaultBus.UnSubscribe(id)
+func UnSubscribe(id SubscriptionID) {
+	defaultBus.UnSubscribe(id)
 }
 
 // UnSubscribeAll 使用默认总线取消所有订阅
 func UnSubscribeAll() {
-    defaultBus.UnSubscribeAll()
+	defaultBus.UnSubscribeAll()
 }
 
 // Close 关闭默认总线
 func Close() error {
-    return defaultBus.Close()
+	return defaultBus.Close()
 }
