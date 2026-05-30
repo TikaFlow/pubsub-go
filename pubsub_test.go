@@ -313,45 +313,6 @@ func TestWildcardSubscribe(t *testing.T) {
 	mu.Unlock()
 }
 
-func TestGlobalDefaultBus(t *testing.T) {
-	var wg sync.WaitGroup
-	received := false
-
-	handler := func(topic string, message any) {
-		defer wg.Done()
-		received = true
-	}
-
-	wg.Add(1)
-	id, err := Subscribe("global/test", handler)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = Publish("global/test", "msg")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout")
-	}
-
-	if !received {
-		t.Error("expected received == true")
-	}
-
-	UnSubscribe(id)
-}
-
 func TestCloseBus(t *testing.T) {
 	bus := New()
 

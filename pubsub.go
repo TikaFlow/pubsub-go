@@ -140,9 +140,9 @@ func (bus *dataBus) Publish(topic string, message any) error {
 func (bus *dataBus) unsubTask(id SubscriptionID) {
 	if topic, exists := bus.idMap[id]; exists {
 		delete(bus.subs[topic], id)
-        if len(bus.subs[topic]) == 0 {
-            delete(bus.subs, topic)
-        }
+		if len(bus.subs[topic]) == 0 {
+			delete(bus.subs, topic)
+		}
 		delete(bus.idMap, id)
 	}
 }
@@ -178,37 +178,4 @@ func (bus *dataBus) Close() error {
 	bus.taskPool.Close()
 
 	return nil
-}
-
-// 全局默认实例
-var defaultBus = New()
-
-// Subscribe 使用默认总线订阅主题
-func Subscribe(topic string, handler Handler) (SubscriptionID, error) {
-	return defaultBus.Subscribe(topic, handler)
-}
-
-// SubscribeOnce 使用默认总线单次订阅
-func SubscribeOnce(topic string, handler Handler) (SubscriptionID, error) {
-	return defaultBus.SubscribeOnce(topic, handler)
-}
-
-// Publish 使用默认总线发布消息
-func Publish(topic string, message any) error {
-	return defaultBus.Publish(topic, message)
-}
-
-// UnSubscribe 使用默认总线取消订阅
-func UnSubscribe(id SubscriptionID) {
-	defaultBus.UnSubscribe(id)
-}
-
-// UnSubscribeAll 使用默认总线取消所有订阅
-func UnSubscribeAll() {
-	defaultBus.UnSubscribeAll()
-}
-
-// Close 关闭默认总线
-func Close() error {
-	return defaultBus.Close()
 }
