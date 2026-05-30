@@ -1,4 +1,4 @@
-module pubsub
+module github.com/TikaFlow/pubsub-go
 
 go 1.25
 
