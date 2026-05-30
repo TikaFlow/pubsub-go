@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"errors"
+	"io"
 	"sync/atomic"
 
 	pool "github.com/TikaFlow/worker-pool"
@@ -24,6 +25,16 @@ type subscription struct {
 	topic   string
 	handler Handler
 	once    bool
+}
+
+// Bus 数据总线接口
+type Bus interface {
+	io.Closer
+	Subscribe(topic string, handler Handler) (SubscriptionID, error)
+	SubscribeOnce(topic string, handler Handler) (SubscriptionID, error)
+	Publish(topic string, message any) error
+	UnSubscribe(id SubscriptionID)
+	UnSubscribeAll()
 }
 
 type subscriptionMap map[SubscriptionID]*subscription
