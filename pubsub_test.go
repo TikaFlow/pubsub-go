@@ -31,7 +31,7 @@ func TestTopicMatch(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		res := topicMatch(tc.pattern, tc.topic)
+		res := TopicMatch(tc.pattern, tc.topic)
 		if res != tc.match {
 			t.Errorf("pattern: %q, topic: %q, expected %v, got %v", tc.pattern, tc.topic, tc.match, res)
 		}
@@ -51,7 +51,7 @@ func TestHasWildcard(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		res := hasWildcard(tc.topic)
+		res := HasWildcard(tc.topic)
 		if res != tc.expect {
 			t.Errorf("topic: %q, expected %v, got %v", tc.topic, tc.expect, res)
 		}
@@ -77,7 +77,7 @@ func TestIsValidTopic(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		res := isValidTopic(tc.topic)
+		res := IsValidTopic(tc.topic)
 		if res != tc.expect {
 			t.Errorf("topic: %q, expected %v, got %v", tc.topic, tc.expect, res)
 		}

@@ -67,7 +67,7 @@ func (bus *dataBus) sub(topic string, handler Handler, once bool) (SubscriptionI
 		return 0, ErrBusClosed
 	}
 
-	if !isValidTopic(topic) {
+	if !IsValidTopic(topic) {
 		return 0, ErrInvalidTopic
 	}
 
@@ -106,17 +106,17 @@ func (bus *dataBus) Publish(topic string, message any) error {
 		return ErrBusClosed
 	}
 
-	if hasWildcard(topic) {
+	if HasWildcard(topic) {
 		return ErrInvalidTopic
 	}
 
 	pubTask := func() {
 		for pattern, idSub := range bus.subs {
 			matched := false
-			if !hasWildcard(pattern) {
+			if !HasWildcard(pattern) {
 				matched = pattern == topic
 			} else {
-				matched = topicMatch(pattern, topic)
+				matched = TopicMatch(pattern, topic)
 			}
 
 			if matched {
